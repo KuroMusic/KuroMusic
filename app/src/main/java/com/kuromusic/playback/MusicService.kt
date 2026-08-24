@@ -1553,6 +1553,10 @@ class MusicService :
             if (currentMediaId != null) {
                 Timber.tag(TAG).w("Stream expired for $currentMediaId — re-fetching...")
                 playbackCache.remove(currentMediaId)
+                // Invalidate the cached player response and flag WEB_REMIX so the re-fetch gets a
+                // FRESH URL from a working client instead of replaying the same rejected one.
+                YTPlayerUtils.invalidatePlayerResponse(currentMediaId)
+                YTPlayerUtils.markWebRemixFailed(currentMediaId)
                 scope.launch {
                     preparePlayback(currentMediaId)?.let {
                         playbackCache.put(currentMediaId, it)
@@ -1665,7 +1669,10 @@ class MusicService :
             playbackCache.get(mediaId)?.let { cached ->
                 val expiresAt = cached.fetchedAt + cached.streamExpiresInSeconds * 1000L
                 if (expiresAt > System.currentTimeMillis()) {
-                    return@Factory dataSpec.buildUpon().setUri(cached.streamUrl.toUri()).build()
+                    return@Factory dataSpec.buildUpon()
+                        .setUri(cached.streamUrl.toUri())
+                        .setHttpRequestHeaders(cached.streamHeaders)
+                        .build()
                 }
             }
 
@@ -1691,7 +1698,13 @@ class MusicService :
                 )
             }
 
-            return@Factory dataSpec.buildUpon().setUri(playbackData.streamUrl.toUri()).build()
+            if (playbackData.streamHeaders.isNotEmpty()) {
+                Timber.i("Streaming via %s client with %d custom headers", playbackData.streamClient, playbackData.streamHeaders.size)
+            }
+            return@Factory dataSpec.buildUpon()
+                .setUri(playbackData.streamUrl.toUri())
+                .setHttpRequestHeaders(playbackData.streamHeaders)
+                .build()
         }
 
         // Cache for general playback streaming (temporary cache)

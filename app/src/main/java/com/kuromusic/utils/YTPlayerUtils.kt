@@ -8,12 +8,8 @@ import com.kuromusic.constants.AudioQuality
 import com.kuromusic.innertube.YouTube
 import com.kuromusic.innertube.models.YouTubeClient
 import com.kuromusic.innertube.models.YouTubeClient.Companion.ANDROID_MUSIC
-import com.kuromusic.innertube.models.YouTubeClient.Companion.ANDROID_VR_NO_AUTH
 import com.kuromusic.innertube.models.YouTubeClient.Companion.IOS
 import com.kuromusic.innertube.models.YouTubeClient.Companion.MOBILE
-import com.kuromusic.innertube.models.YouTubeClient.Companion.TVHTML5_SIMPLY_EMBEDDED_PLAYER
-import com.kuromusic.innertube.models.YouTubeClient.Companion.WEB
-import com.kuromusic.innertube.models.YouTubeClient.Companion.WEB_CREATOR
 import com.kuromusic.innertube.models.YouTubeClient.Companion.WEB_REMIX
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -32,6 +28,7 @@ import android.content.Context
 import java.net.URLDecoder
 import java.io.File
 import java.net.URI
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
 import com.kuromusic.constants.InnerTubeCookieKey
@@ -141,23 +138,44 @@ object YTPlayerUtils {
      * Do not use other clients for this because it can result in inconsistent metadata.
      * For example other clients can have different normalization targets (loudnessDb).
      *
-     * [com.metrolist.innertube.models.YouTubeClient.WEB_REMIX] should be preferred here because currently it is the only client which provides:
+     * WEB_REMIX is preferred because it is the only client which provides:
      * - the correct metadata (like loudnessDb)
      * - premium formats
+     * ANDROID_VR was removed as MAIN_CLIENT: YouTube started rejecting its
+     * stream URLs with 403 in August 2026 (see yt-dlp#17456).
      */
-    private val MAIN_CLIENT: YouTubeClient = ANDROID_VR_NO_AUTH
+    private val MAIN_CLIENT: YouTubeClient = WEB_REMIX
     /**
      * Clients used for fallback streams in case the streams of the main client do not work.
      */
     private val STREAM_FALLBACK_CLIENTS: Array<YouTubeClient> = arrayOf(
         ANDROID_MUSIC,
-        WEB_REMIX,
         MOBILE,
-        TVHTML5_SIMPLY_EMBEDDED_PLAYER,
         IOS,
-        WEB,
-        WEB_CREATOR
     )
+
+    private const val WEB_REMIX_FAILURE_TTL_MS = 5 * 60 * 1000L
+
+    // Temporarily skip WEB_REMIX after its stream is rejected (403) so the re-fetch can fall
+    // through to fallback clients instead of looping on the same rejected URL.
+    private val webRemixFailures = ConcurrentHashMap<String, Long>()
+
+    fun markWebRemixFailed(videoId: String) {
+        webRemixFailures[videoId] = System.currentTimeMillis()
+    }
+
+    fun clearWebRemixFailures() {
+        webRemixFailures.clear()
+    }
+
+    private fun hasRecentWebRemixFailure(videoId: String): Boolean {
+        val failedAt = webRemixFailures[videoId] ?: return false
+        if ((System.currentTimeMillis() - failedAt) !in 0 until WEB_REMIX_FAILURE_TTL_MS) {
+            webRemixFailures.remove(videoId, failedAt)
+            return false
+        }
+        return true
+    }
     data class PlaybackData(
         val audioConfig: PlayerResponse.PlayerConfig.AudioConfig?,
         val videoDetails: PlayerResponse.VideoDetails?,
@@ -166,7 +184,24 @@ object YTPlayerUtils {
         val streamUrl: String,
         val streamExpiresInSeconds: Int,
         val fetchedAt: Long = System.currentTimeMillis(),
+        val streamClient: String = "unknown",
+        val streamHeaders: Map<String, String> = emptyMap(),
     )
+
+    /**
+     * Removes all cached player responses for [videoId] so the next playback attempt fetches
+     * fresh URLs. Must be called when a stream is rejected (403) to avoid replaying a dead URL.
+     */
+    fun invalidatePlayerResponse(videoId: String) {
+        val staleKeys = playerCache.keys.filter { it.startsWith("$videoId-") }
+        staleKeys.forEach { key ->
+            playerCache.remove(key)
+            cacheTime.remove(key)
+        }
+        if (staleKeys.isNotEmpty()) {
+            Timber.tag(logTag).d("Invalidated %d cached player responses for %s", staleKeys.size, videoId)
+        }
+    }
 
     // Cache to prevent re-fetching PlayerResponse (Speed up by ~1s)
     private val playerCache = mutableMapOf<String, Result<PlayerResponse>>()
@@ -272,13 +307,9 @@ object YTPlayerUtils {
         var streamExpiresInSeconds: Int? = null
         var streamPlayerResponse: PlayerResponse? = null
 
+        var successClient: YouTubeClient? = null
+
         for (clientIndex in (-1 until STREAM_FALLBACK_CLIENTS.size)) {
-            // Safety: Limit retries to 3 (Main + 3 fallbacks = 4 attempts total)
-            if (clientIndex >= 2) {
-                 Timber.tag(logTag).w("Retry limit reached (Main + 3 fallbacks). Aborting to prevent freeze.")
-                 break
-            }
-            
             // reset for each client
             format = null
             streamUrl = null
@@ -289,6 +320,10 @@ object YTPlayerUtils {
             if (clientIndex == -1) {
                 // try with streams from main client first
                 client = MAIN_CLIENT
+                if (hasRecentWebRemixFailure(videoId)) {
+                    Timber.tag(logTag).v("Skipping MAIN_CLIENT ${client.clientName} - recent stream rejection")
+                    continue
+                }
                 streamPlayerResponse = mainPlayerResponse
                 Timber.tag(logTag).v("Trying stream from MAIN_CLIENT: ${client.clientName}")
             } else {
@@ -328,9 +363,15 @@ object YTPlayerUtils {
                     Timber.tag(logTag).e("Response status: ${streamPlayerResponse?.playabilityStatus?.status}")
                 }
 
+                // Splice NewPipe-derived stream URLs into the response by itag (Metrolist approach).
+                // InnerTube WEB_REMIX CDN URLs 403 on some networks even with valid pot=; NewPipe's
+                // own extraction pipeline produces working URLs.
+                val baseResponse = streamPlayerResponse ?: continue
+                val responseToUse = YouTube.newPipePlayer(videoId, baseResponse) ?: baseResponse
+
                 format =
                     findFormat(
-                        streamPlayerResponse,
+                        responseToUse,
                         audioQuality,
                         connectivityManager,
                     )
@@ -342,7 +383,7 @@ object YTPlayerUtils {
 
                 Timber.tag(logTag).v("Format found: ${format.mimeType}, bitrate: ${format.bitrate}, itag: ${format.itag}")
 
-                streamUrl = findUrlOrNull(format, videoId, streamPlayerResponse)
+                streamUrl = findUrlOrNull(format, videoId, responseToUse)
                 if (streamUrl == null) {
                     Timber.tag(logTag).e("❌ Stream URL not found for format itag: ${format.itag}")
                     continue
@@ -352,8 +393,12 @@ object YTPlayerUtils {
                 // N-transform for web clients
                 if (client.useWebPoTokens) {
                     try {
-                        Timber.tag(logTag).d("Applying n-transform via EjsNTransformSolver")
-                        val transformed = EjsNTransformSolver.transformNParamInUrl(streamUrl!!)
+                        Timber.tag(logTag).d("Applying n-transform via CipherDeobfuscator")
+                        var transformed = CipherDeobfuscator.transformNParamInUrl(streamUrl!!)
+                        if (transformed == streamUrl && streamUrl!!.contains("n=")) {
+                            Timber.tag(logTag).d("Cipher n-transform unavailable, trying EjsNTransformSolver")
+                            transformed = EjsNTransformSolver.transformNParamInUrl(streamUrl!!)
+                        }
                         if (transformed != streamUrl) {
                             streamUrl = transformed
                             Timber.tag(logTag).d("N-transform applied successfully")
@@ -378,26 +423,39 @@ object YTPlayerUtils {
 
                 Timber.tag(logTag).v("Stream expires in: $streamExpiresInSeconds seconds")
 
+                // MAIN_CLIENT (WEB_REMIX): skip HEAD validation like upstream Metrolist — its URLs
+                // can 403 on HEAD yet serve fine on the byte-range GET ExoPlayer performs. A truly
+                // rejected WEB_REMIX stream is recovered by MusicService's 403 handler via
+                // markWebRemixFailed() + invalidatePlayerResponse(), which makes the retry fall
+                // through to the validated fallback clients below.
+                if (clientIndex == -1) {
+                    successClient = client
+                    break
+                }
+
                 if (clientIndex == STREAM_FALLBACK_CLIENTS.size - 1) {
                     /** skip [validateStatus] for last client */
                     Timber.tag(logTag).v("Using last fallback client without validation: ${STREAM_FALLBACK_CLIENTS[clientIndex].clientName}")
+                    successClient = client
                     break
                 }
-                
-                // ⚡ OPTIMIZATION: Skip validation for everyone to speed up playback
-                Timber.tag(logTag).i("⚡ Skipping validation for speed (Instant Play)")
-                break
 
-                /* 
-                // Removed to optimize speed
-                if (validateStatus(streamUrl)) {
+                if (validateStatus(streamUrl!!, client.streamHeaders())) {
                     // working stream found
-                    Timber.tag(logTag).d("Stream validated successfully with client: ${if (clientIndex == -1) MAIN_CLIENT.clientName else STREAM_FALLBACK_CLIENTS[clientIndex].clientName}")
+                    Timber.tag(logTag).d("Stream validated successfully with client: ${client.clientName}")
+                    successClient = client
                     break
                 } else {
-                    Timber.tag(logTag).d("Stream validation failed for client: ${if (clientIndex == -1) MAIN_CLIENT.clientName else STREAM_FALLBACK_CLIENTS[clientIndex].clientName}")
+                    Timber.tag(logTag).d("Stream validation failed for client: ${client.clientName}")
+                    // A failing web-based fallback can mean a stale/wrong cipher config — ask the
+                    // cipher to re-fetch it (rate-limited internally, off this coroutine) so the
+                    // next resolution recovers without an app restart.
+                    if (client.useWebPoTokens || client.clientName.startsWith("WEB")) {
+                        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                            runCatching { CipherDeobfuscator.onStreamRejected() }
+                        }
+                    }
                 }
-                */
             } else {
                 Timber.tag(logTag).d("Player response status not OK: ${streamPlayerResponse?.playabilityStatus?.status}, reason: ${streamPlayerResponse?.playabilityStatus?.reason}")
             }
@@ -441,6 +499,8 @@ object YTPlayerUtils {
             format,
             streamUrl,
             streamExpiresInSeconds,
+            streamClient = successClient?.clientName ?: "unknown",
+            streamHeaders = successClient?.streamHeaders().orEmpty(),
         )
     }
 }
@@ -506,21 +566,56 @@ object YTPlayerUtils {
      * If this returns true the url is likely to work.
      * If this returns false the url might cause an error during playback.
      */
-    private fun validateStatus(url: String): Boolean {
+    private fun validateStatus(url: String, requestHeaders: Map<String, String> = emptyMap()): Boolean {
         Timber.tag(logTag).d("Validating stream URL status")
         try {
             val requestBuilder = Request.Builder()
                 .head()
                 .url(url)
-            val response = httpClient!!.newCall(requestBuilder.build()).execute()
-            val isSuccessful = response.isSuccessful
-            Timber.tag(logTag).d("Stream URL validation result: ${if (isSuccessful) "Success" else "Failed"} (${response.code})")
-            return isSuccessful
+            requestHeaders.forEach { (name, value) -> requestBuilder.header(name, value) }
+            validationClient.newCall(requestBuilder.build()).execute().use { response ->
+                val isSuccessful = response.isSuccessful
+                Timber.tag(logTag).d("Stream URL validation result: ${if (isSuccessful) "Success" else "Failed"} (${response.code})")
+                return isSuccessful
+            }
         } catch (e: Exception) {
             Timber.tag(logTag).e(e, "Stream URL validation failed with exception")
             reportException(e)
         }
         return false
+    }
+
+    /**
+     * Plain client for stream validation — no MUSIC_CLIENT_HEADERS network interceptor (which
+     * would append a second User-Agent) and no forced HTTP caching.
+     */
+    private val validationClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .proxy(YouTube.proxy)
+            .build()
+    }
+
+    /**
+     * Per-client headers required by the googlevideo CDN. Web-based URLs are rejected with 403
+     * unless the correct Origin/Referer/User-Agent are sent when downloading the stream.
+     */
+    private fun YouTubeClient.streamHeaders(): Map<String, String> = buildMap {
+        put("User-Agent", userAgent)
+        put("Accept", "*/*")
+        put("Accept-Language", "en-US,en;q=0.9")
+
+        when {
+            clientName == "WEB_REMIX" -> {
+                put("Referer", "https://music.youtube.com/")
+                put("Origin", "https://music.youtube.com")
+            }
+            clientName.startsWith("WEB") || clientName.startsWith("TVHTML5") -> {
+                put("Referer", "https://www.youtube.com/")
+                put("Origin", "https://www.youtube.com")
+            }
+        }
     }
     /**
      * Wrapper around the [NewPipeUtils.getSignatureTimestamp] function which reports exceptions

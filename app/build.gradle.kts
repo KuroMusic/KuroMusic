@@ -29,11 +29,11 @@ android {
         applicationId = "com.kuromusic"
         minSdk = 24
         targetSdk = 35
-        versionCode = 12
-        versionName = "1.3.0"
+        versionCode = 13
+        versionName = "1.3.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("String", "GOOGLE_API_KEY", "\"${localProperties.getProperty("GOOGLE_API_KEY") ?: ""}\"")
-        buildConfigField("String", "PO_TOKEN_REQUEST_KEY", "\"${localProperties.getProperty("PO_TOKEN_REQUEST_KEY") ?: ""}\"")
+        buildConfigField("String", "GOOGLE_API_KEY", "\"${localProperties.getProperty("GOOGLE_API_KEY") ?: "AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw"}\"")
+        buildConfigField("String", "PO_TOKEN_REQUEST_KEY", "\"${localProperties.getProperty("PO_TOKEN_REQUEST_KEY") ?: "O43z0dpjhgX20SCx4KAo"}\"")
         buildConfigField("String", "INNER_TUBE_API_KEY", "\"${localProperties.getProperty("INNER_TUBE_API_KEY") ?: ""}\"")
         buildConfigField("String", "YOUTUBE_SESSION_COOKIES", "\"${localProperties.getProperty("YOUTUBE_SESSION_COOKIES") ?: ""}\"")
         buildConfigField("long", "DISCORD_APP_ID", "${localProperties.getProperty("DISCORD_APP_ID") ?: "1411019391843172514"}L")
